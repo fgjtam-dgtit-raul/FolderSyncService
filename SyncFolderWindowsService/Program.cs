@@ -11,6 +11,8 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Win32;
 using RabbitMQ.Client;
+using System.Data.Common;
+using System.Configuration;
 
 namespace SyncFolderWindowsService
 {
@@ -21,7 +23,7 @@ namespace SyncFolderWindowsService
         private EventLog eventLog;
 
         private const string StorageSyncIdPath = @"SOFTWARE\DGTITFolders";
-        private const string StorageSyncIdKey = "syncid";
+        private const string StorageSyncIdKey = "synchronizationid";
 
         private readonly TimeSpan syncInterval = TimeSpan.FromSeconds(15);
         private readonly string rabbitMqHost = "localhost";
@@ -97,25 +99,79 @@ namespace SyncFolderWindowsService
 
 
         #region SQLServer access
-        private (IEnumerable<string>, long) GetChangedFolders(long syncId)
+        private (IEnumerable<string>, long) GetChangedFolders(long synchronizationId)
         {
-            // TODO: with the sync id, get the folders modified and the new syncId
-            long[] foldersModified = new long[] { 1 }; // sample id
-
-            var foldersSnapshot = new string[foldersModified.Length];
-
-            using (var sqlConnection = new SqlConnection("Server=172.23.6.109;Database=SJP_CARPETAS;User Id=sa;Password=PasswordO1.;Encrypt=true;TrustServerCertificate=true;"))
+            var sqlConnection = new SqlConnection(Properties.Settings.Default.SJP_CARPETAS_CON);
+            sqlConnection.Open();
+            var foldersSnapshot = new List<string>();
+            long newSynchronizationId = synchronizationId;
+            try
             {
-                sqlConnection.Open();
-                for (int i = 0; i < foldersModified.Length; i++)
+                // * get the folders modified and the new syncId
+                var (foldersModified, newSyncId) = this.GetFolders(sqlConnection, synchronizationId);
+               
+                // * get the snapshot of each folder
+                foreach (var folderId in foldersModified)
                 {
-                    foldersSnapshot[i] = this.GetFolderSnapshot(sqlConnection, foldersModified[i]);
+                    foldersSnapshot.Add(this.GetFolderSnapshot(sqlConnection, folderId));
                 }
+                newSynchronizationId = newSyncId;
+            }
+            catch(Exception ex)
+            {
+                eventLog.WriteEntry($"Error al get the folders data: {ex.Message}", EventLogEntryType.Error);
+            }
+            finally
+            {
                 sqlConnection.Close();
+                sqlConnection.Dispose();
             }
 
-            var newSyncId = syncId + 1;
-            return (foldersSnapshot, newSyncId);
+            return (foldersSnapshot, newSynchronizationId);
+        }
+
+        private (IEnumerable<long>, long) GetFolders(SqlConnection sqlConnection, long synchronizationId)
+        {
+            if (sqlConnection.State != ConnectionState.Open)
+            {
+                throw new InvalidOperationException("The connection is closed");
+            }
+
+            var sqlCommand = new SqlCommand("[SYNCF].[SP_ObtenerCarpetaModificadas]", sqlConnection)
+            {
+                CommandType = CommandType.StoredProcedure
+            };
+            sqlCommand.Parameters.AddWithValue("@PREVIOUS_SYNC_ID", synchronizationId);
+
+            // * prepara data set
+            var dataset = new DataSet();
+
+            // * fill the response into the dataset
+            var adapter = new SqlDataAdapter(sqlCommand);
+            adapter.Fill(dataset);
+            adapter.Dispose();
+
+            // * process the response
+            if(dataset.Tables.Count != 2)
+            {
+                throw new Exception("Invalid response from the StoreProcedure");
+            }
+
+            // * retrive the folders updated
+            var listFolders = new List<long>();
+            foreach(DataRow row in dataset.Tables[0].Rows)
+            {
+                var __folderId = long.TryParse(row["ID_CARPETA"].ToString(), out long fi) ? fi : 0;
+                if(__folderId > 0)
+                {
+                    listFolders.Add(__folderId);
+                }
+            }
+
+            // * retrive the new synchronization Id
+            long newSynchronizationId = long.Parse(dataset.Tables[1].Rows[0][0].ToString());
+
+            return (listFolders, newSynchronizationId);
         }
 
         private string GetFolderSnapshot(SqlConnection sqlConnection, long folderId)
@@ -125,7 +181,7 @@ namespace SyncFolderWindowsService
                 throw new InvalidOperationException("The connection is closed");
             }
 
-            var sqlCommand = new SqlCommand("[dbo].[SP_CarpetaSnapshot]", sqlConnection)
+            var sqlCommand = new SqlCommand("[SYNCF].[SP_CarpetaSnapshot]", sqlConnection)
             {
                 CommandType = CommandType.StoredProcedure
             };
