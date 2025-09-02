@@ -51,6 +51,22 @@ To configure the database connection for this application, open the App.config o
 </configuration>
 ```
 
+### Set the RabbitMQ connection string
+```xml
+<configuration>
+    <configSections>
+    </configSections>
+    <appSettings>
+		<add key="RabbitMqHost" value=""/>
+		<add key="RabbitMqPort" value=""/>
+		<add key="RabbitMqUser" value=""/>
+		<add key="RabbitMqPassword" value=""/>
+	</appSettings>
+    .
+    .
+</configuration>
+```
+
 ### Allow Execute PS1 Files
 
 Configure to execute .ps1 files on the current user.

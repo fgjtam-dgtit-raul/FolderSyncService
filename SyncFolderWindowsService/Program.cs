@@ -16,6 +16,7 @@ using System.Configuration;
 
 namespace SyncFolderWindowsService
 {
+
     internal class Program : ServiceBase
     {
         private const string EventLogSource = "DGTIT Sync Folders";
@@ -24,9 +25,11 @@ namespace SyncFolderWindowsService
 
         private const string StorageSyncIdPath = @"SOFTWARE\DGTITFolders";
         private const string StorageSyncIdKey = "synchronizationid";
-
+        private readonly string rabbitMqHost;
+        private readonly int rabbitMqPort;
+        private readonly string rabbitMqUser;
+        private readonly string rabbitMqPassword;
         private readonly TimeSpan syncInterval = TimeSpan.FromSeconds(15);
-        private readonly string rabbitMqHost = "localhost";
 
         private Task processTask;
         private CancellationTokenSource cancellationTokenSource;
@@ -39,6 +42,10 @@ namespace SyncFolderWindowsService
         public Program()
         {
             this.ServiceName = "DGTIT Sync Folders";
+            rabbitMqHost = ConfigurationManager.AppSettings["RabbitMqHost"];
+            rabbitMqPort = int.Parse(ConfigurationManager.AppSettings["RabbitMqPort"]);
+            rabbitMqUser = ConfigurationManager.AppSettings["RabbitMqUser"];
+            rabbitMqPassword = ConfigurationManager.AppSettings["RabbitMqPassword"];
 
             // Set up event logging
             eventLog = new EventLog();
@@ -240,7 +247,12 @@ namespace SyncFolderWindowsService
         #region RabbitMQ
         private async Task SendFolders(IEnumerable<string> folders)
         {
-            var factory = new ConnectionFactory() { HostName = this.rabbitMqHost };
+            var factory = new ConnectionFactory() {
+                HostName = rabbitMqHost,
+                Port = rabbitMqPort,
+                UserName = rabbitMqUser,
+                Password = rabbitMqPassword
+            };
             var connection = await factory.CreateConnectionAsync();
             using (var channel = await connection.CreateChannelAsync())
             {
