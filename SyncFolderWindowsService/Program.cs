@@ -24,7 +24,7 @@ namespace SyncFolderWindowsService
         private EventLog eventLog;
 
         private const string StorageSyncIdPath = @"SOFTWARE\DGTITFolders";
-        private const string StorageSyncIdKey = "synchronizationid";
+        private const string StorageSyncIdKeyPrefix = "synchronizationid_";
         private readonly string rabbitMqHost;
         private readonly int rabbitMqPort;
         private readonly string rabbitMqUser;
@@ -60,6 +60,15 @@ namespace SyncFolderWindowsService
             eventLog.Log = EventLogName;
         }
 
+        // List of tables to sync (add all your tables here)
+        private readonly List<TableSyncInfo> tablesToSync = new List<TableSyncInfo>
+        {
+            new TableSyncInfo("PGJ_CARPETA", "ID_CARPETA"),
+            new TableSyncInfo("PGJ_DOCUMENTO", "ID_DOCUMENTO"),
+            new TableSyncInfo("PGJ_EXPEDIENTE", "ID_EXPEDIENTE"),
+            // Add more tables: new TableSyncInfo("TABLE_NAME", "ID_COLUMN")
+        };
+
         protected override void OnStart(string[] args)
         {
             eventLog.WriteEntry("DGTIT Sync Service started", EventLogEntryType.Information);
@@ -67,28 +76,39 @@ namespace SyncFolderWindowsService
             cancellationTokenSource = new CancellationTokenSource();
             var cancelationToken = cancellationTokenSource.Token;
 
-            processTask = Task.Run( async () =>
+            processTask = Task.Run(async () =>
             {
                 while (!cancelationToken.IsCancellationRequested)
                 {
                     eventLog.WriteEntry("Start synchronized data.", EventLogEntryType.Information);
                     try
                     {
-                        // 1.- Get current synchronized id
-                        var syncId = GetCurrentSyncId();
+                        foreach (var table in tablesToSync)
+                        {
+                            // 1. Get current sync id for this table
+                            var syncId = GetCurrentSyncId(table.TableName);
 
-                        // 2.- With the synchronized id retrive the new changes of the database and the new synchronized id
-                        var (folders, newSyncId) = GetChangedFolders(syncId);
+                            // 2. Get changed rows and new sync id
+                            var (changedRows, newSyncId) = GetChangedRowsWithData(table, syncId);
 
-                        // 3.- Send each folderdata to RabbitMQ Queue
-                        await SendFolders(folders);
+                            // 3. Serialize each changed row to JSON and send to RabbitMQ
+                            var snapshots = new List<string>();
+                            foreach (var row in changedRows)
+                            {
+                                var jsonData = System.Text.Json.JsonSerializer.Serialize(row);
+                                snapshots.Add(jsonData);
+                            }
 
-                        // 4.- Save the new synchronized id
-                        SaveSyncId(newSyncId);
+                            // 4. Send to RabbitMQ
+                            await SendData(snapshots);
+
+                            // 5. Save new sync id for this table
+                            SaveSyncId(table.TableName, newSyncId);
+                        }
                     }
-                    catch(Exception ex)
+                    catch (Exception ex)
                     {
-                        eventLog.WriteEntry($"Error al actualizar las carpetas: {ex.Message} {ex.StackTrace}", EventLogEntryType.Error);
+                        eventLog.WriteEntry($"Error: {ex.Message} {ex.StackTrace}", EventLogEntryType.Error);
                     }
                     eventLog.WriteEntry("End synchronized data.", EventLogEntryType.Information);
 
@@ -96,7 +116,7 @@ namespace SyncFolderWindowsService
                 }
             }, cancelationToken);
         }
-        
+
         protected override void OnStop()
         {
             this.cancellationTokenSource?.Cancel();
@@ -104,106 +124,98 @@ namespace SyncFolderWindowsService
             base.OnStop();
         }
 
-
         #region SQLServer access
-        private (IEnumerable<string>, long) GetChangedFolders(long synchronizationId)
+        // Helper class for table info
+        private class TableSyncInfo
         {
-            var sqlConnection = new SqlConnection(Properties.Settings.Default.SJP_CARPETAS_CON);
-            sqlConnection.Open();
-            var foldersSnapshot = new List<string>();
-            long newSynchronizationId = synchronizationId;
-            try
+            public string TableName { get; }
+            public string IdColumn { get; }
+            public TableSyncInfo(string tableName, string idColumn)
             {
-                // * get the folders modified and the new syncId
-                var (foldersModified, newSyncId) = this.GetFolders(sqlConnection, synchronizationId);
-               
-                // * get the snapshot of each folder
-                foreach (var folderId in foldersModified)
-                {
-                    foldersSnapshot.Add(this.GetFolderSnapshot(sqlConnection, folderId));
-                }
-                newSynchronizationId = newSyncId;
+                TableName = tableName;
+                IdColumn = idColumn;
             }
-            catch(Exception ex)
-            {
-                eventLog.WriteEntry($"Error al get the folders data: {ex.Message}", EventLogEntryType.Error);
-            }
-            finally
-            {
-                sqlConnection.Close();
-                sqlConnection.Dispose();
-            }
-
-            return (foldersSnapshot, newSynchronizationId);
         }
 
-        private (IEnumerable<long>, long) GetFolders(SqlConnection sqlConnection, long synchronizationId)
+        // Get changed rows and their data for a table using Change Tracking
+        private (List<Dictionary<string, object>>, long) GetChangedRowsWithData(TableSyncInfo table, long syncId)
         {
-            if (sqlConnection.State != ConnectionState.Open)
+            using (var sqlConnection = new SqlConnection(Properties.Settings.Default.SJP_CARPETAS_CON))
             {
-                throw new InvalidOperationException("The connection is closed");
-            }
-
-            var sqlCommand = new SqlCommand("[SYNCF].[SP_ObtenerCarpetaModificadas]", sqlConnection)
-            {
-                CommandType = CommandType.StoredProcedure
-            };
-            sqlCommand.Parameters.AddWithValue("@PREVIOUS_SYNC_ID", synchronizationId);
-
-            // * prepara data set
-            var dataset = new DataSet();
-
-            // * fill the response into the dataset
-            var adapter = new SqlDataAdapter(sqlCommand);
-            adapter.Fill(dataset);
-            adapter.Dispose();
-
-            // * process the response
-            if(dataset.Tables.Count != 2)
-            {
-                throw new Exception("Invalid response from the StoreProcedure");
-            }
-
-            // * retrive the folders updated
-            var listFolders = new List<long>();
-            foreach(DataRow row in dataset.Tables[0].Rows)
-            {
-                var __folderId = long.TryParse(row["ID_CARPETA"].ToString(), out long fi) ? fi : 0;
-                if(__folderId > 0)
+                sqlConnection.Open();
+                
+                // Get current and min valid version
+                long currentVersion = 0;
+                long minValidVersion = 0;
+                using (var cmdVersion = new SqlCommand($@"
+                    SELECT CHANGE_TRACKING_CURRENT_VERSION() AS CurrentVersion, 
+                           CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID(N'dbo.{table.TableName}')) AS MinValidVersion", sqlConnection))
+                using (var reader = cmdVersion.ExecuteReader())
                 {
-                    listFolders.Add(__folderId);
+                    if (reader.Read())
+                    {
+                        currentVersion = reader.GetInt64(0);
+                        minValidVersion = reader.IsDBNull(1) ? 0 : reader.GetInt64(1);
+                    }
                 }
+
+                if (syncId < minValidVersion)
+                {
+                    throw new Exception($"Sync anchor is too old for dbo.{table.TableName}. Reinitialize and retry.");
+                }
+
+                // Get changed rows with all their data
+                var changedRows = new List<Dictionary<string, object>>();
+                var query = $@"
+                    SELECT CT.{table.IdColumn}, 
+                           CT.SYS_CHANGE_OPERATION, 
+                           CT.SYS_CHANGE_VERSION, 
+                           T.*
+                    FROM CHANGETABLE(CHANGES dbo.{table.TableName}, @syncId) AS CT
+                    LEFT JOIN dbo.{table.TableName} AS T ON CT.{table.IdColumn} = T.{table.IdColumn}
+                ";
+
+                using (var cmd = new SqlCommand(query, sqlConnection))
+                {
+                    cmd.Parameters.AddWithValue("@syncId", syncId);
+                    using (var adapter = new SqlDataAdapter(cmd))
+                    {
+                        var dt = new DataTable();
+                        adapter.Fill(dt);
+                        
+                        foreach (DataRow row in dt.Rows)
+                        {
+                            var dict = new Dictionary<string, object>
+                            {
+                                ["TableName"] = table.TableName,
+                                ["Operation"] = row["SYS_CHANGE_OPERATION"].ToString(),
+                                ["ChangeVersion"] = row["SYS_CHANGE_VERSION"]
+                            };
+                            
+                            // Add all table columns (handle NULL values for deleted rows)
+                            foreach (DataColumn col in dt.Columns)
+                            {
+                                if (!col.ColumnName.StartsWith("SYS_CHANGE_"))
+                                {
+                                    dict[col.ColumnName] = row[col] == DBNull.Value ? null : row[col];
+                                }
+                            }
+                            changedRows.Add(dict);
+                        }
+                    }
+                }
+
+                return (changedRows, currentVersion);
             }
-
-            // * retrive the new synchronization Id
-            long newSynchronizationId = long.Parse(dataset.Tables[1].Rows[0][0].ToString());
-
-            return (listFolders, newSynchronizationId);
-        }
-
-        private string GetFolderSnapshot(SqlConnection sqlConnection, long folderId)
-        {
-            if(sqlConnection.State != ConnectionState.Open)
-            {
-                throw new InvalidOperationException("The connection is closed");
-            }
-
-            var sqlCommand = new SqlCommand("[SYNCF].[SP_CarpetaSnapshot]", sqlConnection)
-            {
-                CommandType = CommandType.StoredProcedure
-            };
-            sqlCommand.Parameters.AddWithValue("@ID_CARPETA", folderId);
-
-            var sqlResult = sqlCommand.ExecuteScalar().ToString();
-            return sqlResult;
         }
         #endregion
 
-
         #region Windows register access
-        private long GetCurrentSyncId()
+        // Registry helpers for per-table sync id
+        private long GetCurrentSyncId(string tableName)
         {
             long syncid = 0;
+            string keyName = StorageSyncIdKeyPrefix + tableName;
             using (RegistryKey baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64))
             {
                 using (RegistryKey key = baseKey.OpenSubKey(StorageSyncIdPath))
@@ -213,22 +225,26 @@ namespace SyncFolderWindowsService
                         throw new ArgumentNullException("key", "The RegistryKey was not found.");
                     }
 
-                    var currentValue = key.GetValue(StorageSyncIdKey)?.ToString();
+                    var currentValue = key.GetValue(keyName)?.ToString();
                     if (string.IsNullOrEmpty(currentValue))
                     {
-                        throw new ArgumentException("key", "The RegistryKey value has a invalid format.");
+                        // If not found, start from 0
+                        syncid = 0;
                     }
-
-                    syncid = long.TryParse(currentValue, out long currentId)
-                            ? currentId
-                            : throw new ArgumentException($"can't parse the stored id '{currentValue}'");
+                    else
+                    {
+                        syncid = long.TryParse(currentValue, out long currentId)
+                                ? currentId
+                                : throw new ArgumentException($"can't parse the stored id '{currentValue}'");
+                    }
                 }
             }
             return syncid;
         }
 
-        private void SaveSyncId(long syncid)
+        private void SaveSyncId(string tableName, long syncid)
         {
+            string keyName = StorageSyncIdKeyPrefix + tableName;
             using (RegistryKey baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64))
             {
                 using (RegistryKey key = baseKey.OpenSubKey(StorageSyncIdPath, true)) // Specify to write
@@ -237,7 +253,7 @@ namespace SyncFolderWindowsService
                     {
                         throw new ArgumentNullException("key", "The RegistryKey was not found.");
                     }
-                    key.SetValue(StorageSyncIdKey, syncid.ToString());
+                    key.SetValue(keyName, syncid.ToString());
                 }
             }
         }
@@ -245,7 +261,7 @@ namespace SyncFolderWindowsService
 
 
         #region RabbitMQ
-        private async Task SendFolders(IEnumerable<string> folders)
+        private async Task SendData(IEnumerable<string> data)
         {
             var factory = new ConnectionFactory() {
                 HostName = rabbitMqHost,
@@ -264,9 +280,9 @@ namespace SyncFolderWindowsService
                     arguments: null
                 );
 
-                foreach(var folder in folders)
+                foreach(var item in data)
                 {
-                    await SendMessage(channel, folder);
+                    await SendMessage(channel, item);
                 }
             }
             await connection.DisposeAsync();
