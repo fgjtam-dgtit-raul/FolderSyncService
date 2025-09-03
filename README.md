@@ -21,6 +21,53 @@ new TableSyncInfo("PGJ_DOCUMENTO", "ID_DOCUMENTO"),
 // Add all 40 tables here...
 ```
 
+# Windows Service Sync
+
+## Multi-Database Synchronization
+
+This service supports synchronizing data from multiple databases to a centralized PostgreSQL database. Each source database is identified by unique identifiers to prevent ID conflicts.
+
+### Configuration for Multiple Databases
+
+Each Windows Service instance should be configured with unique identifiers:
+
+```xml
+<appSettings>
+    <!-- Unique database identifier -->
+    <add key="DatabaseIdentifier" value="SJP_CARPETAS_LOCATION_A"/>
+    <!-- Unique location code -->
+    <add key="LocationCode" value="LOC_A"/>
+</appSettings>
+```
+
+### Data Structure
+
+Each synchronized record includes:
+- `SourceDatabase`: Identifies the source database
+- `LocationCode`: Short location identifier
+- `GlobalId`: Composite key format: `{LocationCode}_{TableName}_{OriginalId}`
+- `SyncTimestamp`: UTC timestamp of synchronization
+- All original table columns
+
+### PostgreSQL Centralized Database Schema
+
+```sql
+-- Example table structure for centralized database
+CREATE TABLE sync_pgj_carpeta (
+    global_id VARCHAR(255) PRIMARY KEY,
+    source_database VARCHAR(100) NOT NULL,
+    location_code VARCHAR(20) NOT NULL,
+    original_id BIGINT NOT NULL,
+    operation CHAR(1) NOT NULL, -- I/U/D
+    change_version BIGINT NOT NULL,
+    sync_timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
+    -- Original table columns
+    ultima_modificacion TIMESTAMP,
+    -- Add other columns as needed
+    UNIQUE(location_code, original_id)
+);
+```
+
 In Database create a Store Procedure to handle changes
 
 ```sql

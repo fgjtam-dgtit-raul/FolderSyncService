@@ -31,6 +31,10 @@ namespace SyncFolderWindowsService
         private readonly string rabbitMqPassword;
         private readonly TimeSpan syncInterval = TimeSpan.FromSeconds(15);
 
+        // Database/Location identification for multi-source sync
+        private readonly string databaseIdentifier;
+        private readonly string locationCode;
+
         private Task processTask;
         private CancellationTokenSource cancellationTokenSource;
 
@@ -46,6 +50,10 @@ namespace SyncFolderWindowsService
             rabbitMqPort = int.Parse(ConfigurationManager.AppSettings["RabbitMqPort"]);
             rabbitMqUser = ConfigurationManager.AppSettings["RabbitMqUser"];
             rabbitMqPassword = ConfigurationManager.AppSettings["RabbitMqPassword"];
+
+            // Get database/location identifier from config
+            databaseIdentifier = ConfigurationManager.AppSettings["DatabaseIdentifier"] ?? Environment.MachineName;
+            locationCode = ConfigurationManager.AppSettings["LocationCode"] ?? "DEFAULT";
 
             // Set up event logging
             eventLog = new EventLog();
@@ -187,9 +195,13 @@ namespace SyncFolderWindowsService
                         {
                             var dict = new Dictionary<string, object>
                             {
+                                ["SourceDatabase"] = databaseIdentifier,
+                                ["LocationCode"] = locationCode,
                                 ["TableName"] = table.TableName,
                                 ["Operation"] = row["SYS_CHANGE_OPERATION"].ToString(),
-                                ["ChangeVersion"] = row["SYS_CHANGE_VERSION"]
+                                ["ChangeVersion"] = row["SYS_CHANGE_VERSION"],
+                                ["SyncTimestamp"] = DateTime.UtcNow,
+                                ["GlobalId"] = $"{locationCode}_{table.TableName}_{row[table.IdColumn]}" // Unique global identifier
                             };
                             
                             // Add all table columns (handle NULL values for deleted rows)
